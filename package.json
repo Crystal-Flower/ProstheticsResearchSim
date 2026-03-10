@@ -1,5 +1,6 @@
 {
   "name": "emg-knee-simulator",
+  "homepage": "https://crystal-flower.github.io/ProstheticsResearchSim/",
   "private": true,
   "version": "0.1.0",
   "type": "module",
