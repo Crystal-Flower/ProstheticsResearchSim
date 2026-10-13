@@ -1,291 +1,148 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import BionicKneeSVG from "./components/BionicKneeSVG.jsx";
+import AnatomyKneeSVG from "./components/AnatomyKneeSVG.jsx";
+import SignalOscilloscope from "./components/SignalOscilloscope.jsx";
+import SpectrumAndPhase from "./components/SpectrumAndPhase.jsx";
+import CalibrationModal from "./components/CalibrationModal.jsx";
+import { BiomechanicalLeg, getGaitPhase, GAIT_PHASES } from "./models/biomechanics.js";
+import {
+  CONTROLLER_MODES,
+  runBaselineController,
+  runHillController,
+  OnlineAdaptiveMLP,
+  BiomimeticImpedanceController,
+} from "./models/aiControllers.js";
+import { EMGSynthesizer, SignalProcessor, computeFFT32 } from "./dsp/emgEngine.js";
+import { AudioBioInput } from "./dsp/audioBioInput.js";
 
-// ─── EMG Processing (mirrors EMGProcessor.cs) ───────────────────────────────
-function processEMG(rawValue, prevProcessed, smoothingFactor) {
-  const rectified = Math.abs(rawValue);
-  return prevProcessed + smoothingFactor * (rectified - prevProcessed);
-}
+const HIST = 120;
 
-// ─── Neural Network (mirrors EMGNeuralNetwork.cs) ────────────────────────────
-function predict(input) {
-  return Math.min(1, Math.max(0, input));
-}
-
-// ─── Noise Generator for realistic EMG simulation ────────────────────────────
-function generateEMGNoise(t, activity) {
-  const base = activity;
-  const noise =
-    Math.sin(t * 47.3) * 0.08 +
-    Math.sin(t * 123.7) * 0.04 +
-    Math.sin(t * 89.1) * 0.06 +
-    (Math.random() - 0.5) * 0.12;
-  return Math.min(1, Math.max(0, base + noise * activity));
-}
-
-// ─── SVG Knee Anatomy ────────────────────────────────────────────────────────
-function KneeAnatomySVG({ angle, emgActivity }) {
-  const femurAngle = -angle * 0.4;
-  const tibiaAngle = angle;
-  const muscleStrain = emgActivity;
-  const quadColor = `rgba(220, 80, 60, ${0.3 + muscleStrain * 0.6})`;
-  const hamColor = `rgba(60, 120, 220, ${0.2 + muscleStrain * 0.4})`;
-
-  return (
-    <svg viewBox="0 0 260 400" className="knee-svg" style={{ width: "100%", maxWidth: 260, height: "auto" }}>
-      <defs>
-        <radialGradient id="boneGrad" cx="50%" cy="30%" r="70%">
-          <stop offset="0%" stopColor="#f5e6c8" />
-          <stop offset="100%" stopColor="#c8a96e" />
-        </radialGradient>
-        <radialGradient id="cartilageGrad" cx="50%" cy="50%" r="60%">
-          <stop offset="0%" stopColor="#b8e0f0" stopOpacity="0.9" />
-          <stop offset="100%" stopColor="#7ab8d4" stopOpacity="0.7" />
-        </radialGradient>
-        <filter id="boneShadow">
-          <feDropShadow dx="2" dy="3" stdDeviation="4" floodColor="#6b4c1a" floodOpacity="0.35" />
-        </filter>
-        <filter id="glow">
-          <feGaussianBlur stdDeviation="3" result="coloredBlur" />
-          <feMerge><feMergeNode in="coloredBlur" /><feMergeNode in="SourceGraphic" /></feMerge>
-        </filter>
-        <linearGradient id="quadGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stopColor="#dc503c" stopOpacity={0.3 + muscleStrain * 0.5} />
-          <stop offset="100%" stopColor="#ff8060" stopOpacity={0.15 + muscleStrain * 0.3} />
-        </linearGradient>
-        <linearGradient id="hamGrad" x1="100%" y1="0%" x2="0%" y2="100%">
-          <stop offset="0%" stopColor="#3c78dc" stopOpacity={0.2 + muscleStrain * 0.4} />
-          <stop offset="100%" stopColor="#60a0ff" stopOpacity={0.1 + muscleStrain * 0.3} />
-        </linearGradient>
-      </defs>
-
-      {/* ── FEMUR group ── */}
-      <g transform={`translate(130, 185) rotate(${femurAngle})`}>
-        {/* Quadriceps muscle */}
-        <ellipse cx="-22" cy="-90" rx="16" ry="75" fill="url(#quadGrad)" />
-        <ellipse cx="22" cy="-90" rx="14" ry="70" fill="url(#quadGrad)" />
-
-        {/* Femur shaft */}
-        <rect x="-14" y="-170" width="28" height="155" rx="8"
-          fill="url(#boneGrad)" filter="url(#boneShadow)" />
-        {/* Femur condyles */}
-        <ellipse cx="0" cy="-12" rx="36" ry="20"
-          fill="url(#boneGrad)" filter="url(#boneShadow)" />
-        <ellipse cx="-20" cy="-8" rx="18" ry="16"
-          fill="url(#boneGrad)" />
-        <ellipse cx="20" cy="-8" rx="18" ry="16"
-          fill="url(#boneGrad)" />
-
-        {/* Patella */}
-        <ellipse cx="0" cy="-28" rx="14" ry="16"
-          fill="url(#boneGrad)" filter="url(#boneShadow)" stroke="#c8a96e" strokeWidth="1" />
-        <ellipse cx="0" cy="-28" rx="8" ry="10"
-          fill="#f5e6c8" opacity="0.6" />
-
-        {/* Articular cartilage on femur */}
-        <ellipse cx="0" cy="-4" rx="30" ry="8"
-          fill="url(#cartilageGrad)" />
-      </g>
-
-      {/* ── TIBIA group ── */}
-      <g transform={`translate(130, 185) rotate(${tibiaAngle})`}>
-        {/* Hamstring muscle */}
-        <ellipse cx="-24" cy="80" rx="13" ry="70" fill="url(#hamGrad)" />
-        <ellipse cx="24" cy="80" rx="13" ry="70" fill="url(#hamGrad)" />
-
-        {/* Tibial plateau - articular cartilage */}
-        <ellipse cx="0" cy="8" rx="28" ry="10"
-          fill="url(#cartilageGrad)" />
-
-        {/* Meniscus (lateral & medial) */}
-        <path d="M-28,10 Q-14,18 -2,12 Q-14,6 -28,10Z"
-          fill="#c8dde8" opacity="0.85" />
-        <path d="M28,10 Q14,18 2,12 Q14,6 28,10Z"
-          fill="#c8dde8" opacity="0.85" />
-
-        {/* Tibia shaft */}
-        <rect x="-12" y="12" width="24" height="155" rx="7"
-          fill="url(#boneGrad)" filter="url(#boneShadow)" />
-        {/* Tibial plateau wide */}
-        <ellipse cx="0" cy="14" rx="32" ry="12"
-          fill="url(#boneGrad)" filter="url(#boneShadow)" />
-
-        {/* Fibula */}
-        <rect x="18" y="30" width="10" height="130" rx="5"
-          fill="#d4b87a" filter="url(#boneShadow)" opacity="0.8" />
-
-        {/* Patellar tendon */}
-        <path d="M-10,-22 Q-6,12 -8,24 M10,-22 Q6,12 8,24"
-          stroke="#e8c878" strokeWidth="4" strokeLinecap="round" fill="none"
-          transform={`translate(0,${-tibiaAngle * 0.3 + femurAngle * 0.2})`} />
-      </g>
-
-      {/* ── Ligaments (ACL/PCL visual) ── */}
-      <g opacity={0.5 + muscleStrain * 0.3}>
-        <line x1="122" y1="183" x2="136" y2="197"
-          stroke="#f0c060" strokeWidth="2.5" strokeLinecap="round"
-          style={{ filter: muscleStrain > 0.6 ? "url(#glow)" : "none" }} />
-        <line x1="138" y1="183" x2="124" y2="197"
-          stroke="#60d0f0" strokeWidth="2.5" strokeLinecap="round"
-          style={{ filter: muscleStrain > 0.6 ? "url(#glow)" : "none" }} />
-      </g>
-
-      {/* ── Angle arc indicator ── */}
-      <g transform="translate(130, 185)">
-        <path
-          d={`M 0 0 L 0 -40 A 40 40 0 ${angle > 180 ? 1 : 0} 1
-            ${40 * Math.sin((angle * Math.PI) / 180)}
-            ${-40 * Math.cos((angle * Math.PI) / 180)} Z`}
-          fill={`rgba(100,220,180,${0.15 + muscleStrain * 0.2})`}
-          stroke="rgba(100,220,180,0.7)" strokeWidth="1"
-        />
-        <text x="8" y="-50" fill="rgba(100,220,180,0.9)"
-          fontSize="11" fontFamily="'JetBrains Mono', monospace" fontWeight="600">
-          {angle.toFixed(1)}°
-        </text>
-      </g>
-    </svg>
-  );
-}
-
-// ─── EMG Waveform Chart ───────────────────────────────────────────────────────
-function EMGChart({ rawHistory, processedHistory, label, color, bgColor }) {
-  const canvasRef = useRef(null);
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    const { width, height } = canvas;
-    ctx.clearRect(0, 0, width, height);
-
-    // Grid
-    ctx.strokeStyle = "rgba(255,255,255,0.05)";
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i++) {
-      const y = (height / 4) * i;
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
-    }
-
-    const drawLine = (data, clr, lw, dash = []) => {
-      if (data.length < 2) return;
-      ctx.strokeStyle = clr;
-      ctx.lineWidth = lw;
-      ctx.setLineDash(dash);
-      ctx.beginPath();
-      data.forEach((v, i) => {
-        const x = (i / (data.length - 1)) * width;
-        const y = height - v * height * 0.9 - height * 0.05;
-        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-      });
-      ctx.stroke();
-      ctx.setLineDash([]);
-    };
-
-    drawLine(rawHistory, "rgba(255,255,255,0.2)", 1, [2, 2]);
-    drawLine(processedHistory, color, 2);
-  }, [rawHistory, processedHistory, color]);
-
-  return (
-    <div style={{
-      background: bgColor,
-      borderRadius: 8,
-      padding: "8px 10px",
-      border: "1px solid rgba(255,255,255,0.07)"
-    }}>
-      <div style={{
-        fontSize: 9,
-        letterSpacing: "0.15em",
-        color: color,
-        fontFamily: "'JetBrains Mono', monospace",
-        marginBottom: 4,
-        textTransform: "uppercase"
-      }}>{label}</div>
-      <canvas ref={canvasRef} width={280} height={60}
-        style={{ width: "100%", height: 60, display: "block", borderRadius: 4 }} />
-    </div>
-  );
-}
-
-// ─── Metric Card ─────────────────────────────────────────────────────────────
-function MetricCard({ label, value, unit, color, sublabel }) {
-  return (
-    <div style={{
-      background: "rgba(255,255,255,0.03)",
-      border: "1px solid rgba(255,255,255,0.07)",
-      borderRadius: 10,
-      padding: "12px 14px",
-      display: "flex",
-      flexDirection: "column",
-      gap: 2
-    }}>
-      <div style={{ fontSize: 9, letterSpacing: "0.12em", color: "rgba(255,255,255,0.35)", textTransform: "uppercase", fontFamily: "monospace" }}>
-        {label}
-      </div>
-      <div style={{ fontSize: 22, fontWeight: 700, color, fontFamily: "'JetBrains Mono', monospace", lineHeight: 1.1 }}>
-        {value}<span style={{ fontSize: 11, marginLeft: 3, opacity: 0.6 }}>{unit}</span>
-      </div>
-      {sublabel && <div style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", fontFamily: "monospace" }}>{sublabel}</div>}
-    </div>
-  );
-}
-
-// ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const HIST = 120;
-  const [running, setRunning] = useState(false);
-  const [smoothing, setSmoothing] = useState(0.1);
-  const [maxAngle, setMaxAngle] = useState(60);
-  const [smoothSpeed, setSmoothSpeed] = useState(5);
-  const [activityPreset, setActivityPreset] = useState("manual");
-  const [manualActivity, setManualActivity] = useState(0.4);
+  const [running, setRunning] = useState(true);
+  const [viewMode, setViewMode] = useState("bionic"); // "bionic" | "anatomy"
+  const [controllerMode, setControllerMode] = useState("impedance"); // "impedance" | "mlp" | "hill" | "baseline"
+  const [activityPreset, setActivityPreset] = useState("walking");
+  const [quadManual, setQuadManual] = useState(0.45);
+  const [hamManual, setHamManual] = useState(0.25);
+  const [maxAngle, setMaxAngle] = useState(68);
+  const [smoothSpeed, setSmoothSpeed] = useState(7.5);
+  const [baseStiffness, setBaseStiffness] = useState(160);
+  const [baseDamping, setBaseDamping] = useState(14);
+  const [stumbleActive, setStumbleActive] = useState(false);
+  const [stumblesCaught, setStumblesCaught] = useState(0);
+  const [audioBioActive, setAudioBioActive] = useState(false);
+  const [calibOpen, setCalibOpen] = useState(false);
+  const [logEntries, setLogEntries] = useState([]);
+
+  const audioInputRef = useRef(new AudioBioInput());
+  const legRef = useRef(new BiomechanicalLeg());
+  const emgEngineRef = useRef(new EMGSynthesizer());
+  const dspRef = useRef(new SignalProcessor(24));
+  const mlpRef = useRef(new OnlineAdaptiveMLP());
+  const impedanceRef = useRef(new BiomimeticImpedanceController());
 
   const stateRef = useRef({
     t: 0,
-    rawValue: 0,
-    processedValue: 0,
-    currentAngle: 0,
-    rawHistory: Array(HIST).fill(0),
-    processedHistory: Array(HIST).fill(0),
-    angleHistory: Array(HIST).fill(0),
-    frameCount: 0,
+    gaitProgress: 0,
+    kneeAngle: 6,
+    kneeVelocity: 0,
+    targetAngle: 6,
+    stiffness: 160,
+    damping: 14,
+    torque: 0,
+    grf: 700,
+    isStable: true,
+    stabilityMargin: 15,
     sampleRate: 0,
-    lastSRTime: Date.now(),
     srFrames: 0,
+    lastSRTime: Date.now(),
+    fatigueLevel: 0,
+    medianFreq: 120,
+    rawQuadHistory: Array(HIST).fill(0),
+    filtQuadHistory: Array(HIST).fill(0),
+    rawHamHistory: Array(HIST).fill(0),
+    filtHamHistory: Array(HIST).fill(0),
+    orbitHistory: Array(70).fill({ angle: 6, velocity: 0 }),
+    fftSpectrum: Array(32).fill(0.1),
+    bioState: {
+      quadActivation: 0.1,
+      hamActivation: 0.1,
+      quadForce: 200,
+      hamForce: 100,
+      coContraction: 0.1,
+    },
   });
 
-  const displayRef = useRef({
-    rawValue: 0,
-    processedValue: 0,
-    currentAngle: 0,
-    aiOutput: 0,
-    sampleRate: 0,
-    rawHistory: Array(HIST).fill(0),
-    processedHistory: Array(HIST).fill(0),
-    angleHistory: Array(HIST).fill(0),
-  });
-
-  const [display, setDisplay] = useState(displayRef.current);
+  const [display, setDisplay] = useState(stateRef.current);
   const rafRef = useRef(null);
-  const logRef = useRef([]);
-  const [logEntries, setLogEntries] = useState([]);
 
-  const getTargetActivity = useCallback((t) => {
-    if (activityPreset === "manual") return manualActivity;
-    if (activityPreset === "walking") return 0.5 + 0.45 * Math.sin(t * 1.8);
-    if (activityPreset === "stairs") return 0.4 + 0.55 * Math.sin(t * 1.1) * (0.5 + 0.5 * Math.sin(t * 0.4));
-    if (activityPreset === "running") return 0.6 + 0.38 * Math.sin(t * 3.2);
-    if (activityPreset === "rehab") return 0.25 + 0.2 * Math.sin(t * 0.7);
-    return manualActivity;
-  }, [activityPreset, manualActivity]);
+  const toggleAudioBio = async () => {
+    if (audioBioActive) {
+      audioInputRef.current.stop();
+      setAudioBioActive(false);
+    } else {
+      const ok = await audioInputRef.current.start();
+      if (ok) setAudioBioActive(true);
+      else alert("Microphone access was denied or is not supported in this browser.");
+    }
+  };
+
+  const triggerStumble = () => {
+    legRef.current.triggerStumble();
+    setStumbleActive(true);
+    setStumblesCaught((c) => c + 1);
+    setTimeout(() => {
+      setStumbleActive(false);
+    }, 850);
+  };
+
+  const getGaitExcitation = useCallback((t, progress) => {
+    if (activityPreset === "manual") {
+      return { q: quadManual, h: hamManual };
+    }
+    if (activityPreset === "walking") {
+      const q = progress < 0.25 ? 0.75 * Math.sin((progress / 0.25) * Math.PI) : 0.08;
+      const h = progress > 0.65 ? 0.65 * Math.sin(((progress - 0.65) / 0.35) * Math.PI) : 0.05;
+      return { q, h };
+    }
+    if (activityPreset === "stairs") {
+      const q = progress < 0.4 ? 0.95 * Math.sin((progress / 0.4) * Math.PI) : 0.12;
+      const h = progress > 0.55 ? 0.85 * Math.sin(((progress - 0.55) / 0.45) * Math.PI) : 0.08;
+      return { q, h };
+    }
+    if (activityPreset === "sprint") {
+      const q = 0.5 + 0.45 * Math.sin(t * 7.5);
+      const h = 0.4 + 0.45 * Math.cos(t * 7.5);
+      return { q: Math.max(0.1, q), h: Math.max(0.1, h) };
+    }
+    if (activityPreset === "ramp") {
+      const q = progress < 0.5 ? 0.85 : 0.15;
+      const h = progress > 0.6 ? 0.4 : 0.05;
+      return { q, h };
+    }
+    if (activityPreset === "rehab") {
+      const q = 0.25 + 0.15 * Math.sin(t * 1.5);
+      const h = 0.2 + 0.12 * Math.cos(t * 1.5);
+      return { q, h };
+    }
+    return { q: quadManual, h: hamManual };
+  }, [activityPreset, quadManual, hamManual]);
 
   useEffect(() => {
-    if (!running) { if (rafRef.current) cancelAnimationFrame(rafRef.current); return; }
+    if (!running) {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      return;
+    }
 
     const DT = 1 / 60;
     const loop = () => {
       const s = stateRef.current;
       s.t += DT;
-      s.frameCount++;
       s.srFrames++;
+
+      const stepDuration = activityPreset === "sprint" ? 0.7 : activityPreset === "stairs" ? 1.4 : 1.1;
+      s.gaitProgress = (s.t / stepDuration) % 1.0;
+
       const now = Date.now();
       if (now - s.lastSRTime >= 1000) {
         s.sampleRate = s.srFrames;
@@ -293,435 +150,701 @@ export default function App() {
         s.lastSRTime = now;
       }
 
-      const activity = Math.min(1, Math.max(0, getTargetActivity(s.t)));
-      s.rawValue = generateEMGNoise(s.t, activity);
-      s.processedValue = processEMG(s.rawValue, s.processedValue, smoothing);
-      const aiOut = predict(s.processedValue);
-      const targetAngle = aiOut * maxAngle;
-      const lerpFactor = 1 - Math.exp(-smoothSpeed * DT);
-      s.currentAngle = s.currentAngle + lerpFactor * (targetAngle - s.currentAngle);
+      let { q: qTarget, h: hTarget } = getGaitExcitation(s.t, s.gaitProgress);
 
-      s.rawHistory = [...s.rawHistory.slice(1), s.rawValue];
-      s.processedHistory = [...s.processedHistory.slice(1), s.processedValue];
-      s.angleHistory = [...s.angleHistory.slice(1), s.currentAngle / maxAngle];
+      if (audioBioActive && audioInputRef.current.isActive) {
+        const audioRec = audioInputRef.current.getRecruitment();
+        qTarget = Math.max(qTarget, audioRec.quadSignal);
+        hTarget = Math.max(hTarget, audioRec.hamSignal);
+      }
 
-      displayRef.current = {
-        rawValue: s.rawValue,
-        processedValue: s.processedValue,
-        currentAngle: s.currentAngle,
-        aiOutput: aiOut,
-        sampleRate: s.sampleRate,
-        rawHistory: s.rawHistory,
-        processedHistory: s.processedHistory,
-        angleHistory: s.angleHistory,
-      };
+      const emgOut = emgEngineRef.current.step(DT, qTarget, hTarget);
+      s.fatigueLevel = emgOut.fatigueLevel;
 
-      if (s.frameCount % 6 === 0) setDisplay({ ...displayRef.current });
+      const dspOut = dspRef.current.process(emgOut.rawQuad, emgOut.rawHam);
+      const bio = legRef.current.update(DT, dspOut.filteredQuad, dspOut.filteredHam);
+      s.bioState = bio;
+
+      let ctrlRes;
+      if (controllerMode === "baseline") {
+        ctrlRes = runBaselineController(dspOut.filteredQuad, s.kneeAngle, maxAngle, smoothSpeed, DT);
+      } else if (controllerMode === "hill") {
+        ctrlRes = runHillController(bio, s.kneeAngle, maxAngle, smoothSpeed, DT);
+      } else if (controllerMode === "mlp") {
+        ctrlRes = mlpRef.current.forward(
+          dspOut.filteredQuad,
+          dspOut.filteredHam,
+          s.kneeAngle,
+          maxAngle,
+          smoothSpeed,
+          DT,
+          legRef.current.stumbleActive
+        );
+      } else {
+        ctrlRes = impedanceRef.current.compute(
+          s.gaitProgress,
+          dspOut.filteredQuad,
+          dspOut.filteredHam,
+          s.kneeAngle,
+          maxAngle,
+          DT,
+          legRef.current.stumbleActive
+        );
+      }
+
+      const prevAngle = s.kneeAngle;
+      s.targetAngle = ctrlRes.targetAngle;
+      s.kneeAngle = ctrlRes.currentAngle;
+      s.kneeVelocity = (s.kneeAngle - prevAngle) / DT;
+      s.stiffness = ctrlRes.stiffness || baseStiffness;
+      s.damping = ctrlRes.damping || baseDamping;
+      s.torque = ctrlRes.torque || 0;
+
+      const inStance = s.gaitProgress < 0.6;
+      s.grf = inStance ? 680 * (0.8 + 0.45 * Math.sin((s.gaitProgress / 0.6) * Math.PI)) : 0;
+      s.isStable = s.kneeAngle < 38 && !legRef.current.stumbleActive;
+      s.stabilityMargin = s.isStable ? 22 - (s.kneeAngle / 38) * 15 : -18;
+
+      s.rawQuadHistory = [...s.rawQuadHistory.slice(1), emgOut.rawQuad];
+      s.filtQuadHistory = [...s.filtQuadHistory.slice(1), dspOut.filteredQuad];
+      s.rawHamHistory = [...s.rawHamHistory.slice(1), emgOut.rawHam];
+      s.filtHamHistory = [...s.filtHamHistory.slice(1), dspOut.filteredHam];
+      s.orbitHistory = [...s.orbitHistory.slice(1), { angle: s.kneeAngle, velocity: s.kneeVelocity }];
+
+      if (Math.floor(s.t * 60) % 4 === 0) {
+        const fft = computeFFT32(s.rawQuadHistory);
+        s.fftSpectrum = fft.spectrum;
+        s.medianFreq = fft.medianFrequency;
+      }
+
+      if (Math.floor(s.t * 60) % 2 === 0) {
+        setDisplay({ ...s });
+      }
+
       rafRef.current = requestAnimationFrame(loop);
     };
-    rafRef.current = requestAnimationFrame(loop);
-    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
-  }, [running, smoothing, maxAngle, smoothSpeed, getTargetActivity]);
 
-  const logSnapshot = () => {
-    const d = displayRef.current;
+    rafRef.current = requestAnimationFrame(loop);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [
+    running,
+    controllerMode,
+    activityPreset,
+    maxAngle,
+    smoothSpeed,
+    baseStiffness,
+    baseDamping,
+    audioBioActive,
+    getGaitExcitation,
+  ]);
+
+  const takeSnapshot = () => {
+    const currentPhase = getGaitPhase(display.gaitProgress);
     const entry = {
       t: new Date().toLocaleTimeString(),
-      angle: d.currentAngle.toFixed(2),
-      emg: d.processedValue.toFixed(4),
-      ai: d.aiOutput.toFixed(4),
-      preset: activityPreset,
+      controller: controllerMode,
+      phase: currentPhase.name,
+      angle: display.kneeAngle.toFixed(1),
+      quadEMG: display.filtQuadHistory[display.filtQuadHistory.length - 1].toFixed(3),
+      hamEMG: display.filtHamHistory[display.filtHamHistory.length - 1].toFixed(3),
+      stiffness: display.stiffness.toFixed(0),
+      damping: display.damping.toFixed(1),
+      torque: display.torque.toFixed(2),
+      mdf: display.medianFreq,
     };
-    logRef.current = [entry, ...logRef.current.slice(0, 19)];
-    setLogEntries([...logRef.current]);
+    setLogEntries((prev) => [entry, ...prev.slice(0, 24)]);
   };
 
-  const resetLog = () => { logRef.current = []; setLogEntries([]); };
-
   const exportCSV = () => {
-    const header = "Timestamp,Activity,EMG_Raw,EMG_Processed,AI_Output,Knee_Angle_deg\n";
-    const rows = logRef.current.map(e =>
-      `${e.t},${e.preset},${e.emg},${e.emg},${e.ai},${e.angle}`
+    const header = "Timestamp,Controller,Gait_Phase,Knee_Angle_deg,Quad_EMG_mV,Ham_EMG_mV,Stiffness_Nm_rad,Damping_Nms_rad,Torque_Nm,MDF_Hz\n";
+    const rows = logEntries.map(
+      (e) => `${e.t},${e.controller},${e.phase},${e.angle},${e.quadEMG},${e.hamEMG},${e.stiffness},${e.damping},${e.torque},${e.mdf}`
     ).join("\n");
     const blob = new Blob([header + rows], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "emg_knee_data.csv";
+    a.href = url;
+    a.download = `prosthetics_telemetry_${Date.now()}.csv`;
     a.click();
   };
 
-  const presets = ["manual", "walking", "stairs", "running", "rehab"];
+  const exportJSON = () => {
+    const sessionData = {
+      timestamp: new Date().toISOString(),
+      controllerMode,
+      activityPreset,
+      stumblesCaught,
+      maxAngle,
+      baseStiffness,
+      baseDamping,
+      telemetryLog: logEntries,
+    };
+    const blob = new Blob([JSON.stringify(sessionData, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `prosthetic_experiment_${Date.now()}.json`;
+    a.click();
+  };
+
+  const currentPhase = getGaitPhase(display.gaitProgress);
 
   return (
     <div style={{
       minHeight: "100vh",
-      background: "#0a0c10",
-      color: "#e8eaf0",
-      fontFamily: "'IBM Plex Sans', 'Helvetica Neue', sans-serif",
-      padding: "0",
+      background: "#07090e",
+      color: "#e2e8f0",
+      fontFamily: "'IBM Plex Sans', -apple-system, sans-serif",
       display: "flex",
       flexDirection: "column",
     }}>
-      {/* Google Fonts */}
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { background: #0a0c10; }
+        body { background: #07090e; }
         input[type=range] {
           -webkit-appearance: none; appearance: none;
-          width: 100%; height: 3px; background: rgba(255,255,255,0.1);
+          width: 100%; height: 4px; background: rgba(255,255,255,0.12);
           border-radius: 2px; outline: none; cursor: pointer;
         }
         input[type=range]::-webkit-slider-thumb {
           -webkit-appearance: none; width: 14px; height: 14px;
-          border-radius: 50%; background: #4de8b0; cursor: pointer;
-          transition: transform 0.15s;
+          border-radius: 50%; background: #38bdf8; cursor: pointer;
+          transition: transform 0.15s, background 0.15s;
         }
-        input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.3); }
+        input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.3); background: #4ade80; }
+        .btn {
+          border: none; cursor: pointer; border-radius: 6px;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 11px; letter-spacing: 0.06em;
+          font-weight: 600; transition: all 0.15s;
+          display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+        }
+        .btn:hover { transform: translateY(-1px); filter: brightness(1.15); }
+        .btn:active { transform: translateY(0); }
+        .preset-btn {
+          padding: 5px 10px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.1);
+          background: rgba(255,255,255,0.03); color: rgba(255,255,255,0.6);
+          cursor: pointer; font-size: 10px; font-family: 'JetBrains Mono', monospace;
+          letter-spacing: 0.08em; text-transform: uppercase;
+          transition: all 0.15s;
+        }
+        .preset-btn:hover { background: rgba(255,255,255,0.08); color: #fff; }
+        .preset-btn.active {
+          background: rgba(56,189,248,0.15); border-color: rgba(56,189,248,0.5);
+          color: #38bdf8; font-weight: 600;
+        }
         .pulse-dot {
           width: 8px; height: 8px; border-radius: 50%;
           animation: pulse 1.2s ease-in-out infinite;
         }
         @keyframes pulse {
           0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: 0.4; transform: scale(0.7); }
+          50% { opacity: 0.3; transform: scale(0.7); }
         }
-        .btn {
-          border: none; cursor: pointer; border-radius: 8px;
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 11px; letter-spacing: 0.08em;
-          font-weight: 600; transition: all 0.15s;
-          display: flex; align-items: center; gap: 6px;
-        }
-        .btn:hover { transform: translateY(-1px); }
-        .btn:active { transform: translateY(0); }
-        .preset-btn {
-          padding: 6px 12px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1);
-          background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.5);
-          cursor: pointer; font-size: 10px; font-family: 'JetBrains Mono', monospace;
-          letter-spacing: 0.1em; text-transform: uppercase;
-          transition: all 0.15s;
-        }
-        .preset-btn:hover { background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.8); }
-        .preset-btn.active {
-          background: rgba(77,232,176,0.12); border-color: rgba(77,232,176,0.4);
-          color: #4de8b0;
-        }
-        scrollbar-width: thin;
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
-        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
       `}</style>
 
-      {/* Header */}
+      {/* HEADER */}
       <header style={{
-        padding: "18px 28px",
-        borderBottom: "1px solid rgba(255,255,255,0.06)",
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-        background: "rgba(255,255,255,0.02)"
+        padding: "12px 24px",
+        background: "rgba(15, 23, 42, 0.75)",
+        borderBottom: "1px solid rgba(255,255,255,0.08)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        backdropFilter: "blur(8px)",
       }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <div style={{
-            width: 36, height: 36, borderRadius: 8,
-            background: "linear-gradient(135deg, #4de8b0, #3b82f6)",
+            width: 38, height: 38, borderRadius: 10,
+            background: "linear-gradient(135deg, #38bdf8, #6366f1)",
             display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: 18
-          }}>🦿</div>
+            fontSize: 20, boxShadow: "0 0 15px rgba(56,189,248,0.3)"
+          }}>
+            ??
+          </div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 600, letterSpacing: "0.02em" }}>
-              EMG Knee Controller
+            <div style={{ fontSize: 16, fontWeight: 700, letterSpacing: "0.02em", color: "#f8fafc" }}>
+              NEURO-BIONIC SIM
+              <span style={{ fontSize: 10, marginLeft: 8, padding: "2px 6px", borderRadius: 4, background: "rgba(56,189,248,0.2)", color: "#38bdf8", border: "1px solid rgba(56,189,248,0.4)" }}>
+                v3.0 NOVEL SOTA
+              </span>
             </div>
-            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", letterSpacing: "0.12em", textTransform: "uppercase", fontFamily: "monospace" }}>
-              Prosthetic Research Simulator · v2.0
+            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", fontFamily: "monospace", letterSpacing: "0.08em" }}>
+              Multi-Channel Agonist-Antagonist EMG ? Hill MTU ? Variable Impedance ? Fall-Prevention Autopilot
             </div>
           </div>
         </div>
+
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          {running && (
-            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10, color: "#4de8b0", fontFamily: "monospace" }}>
-              <div className="pulse-dot" style={{ background: "#4de8b0" }} />
-              LIVE · {display.sampleRate} Hz
-            </div>
-          )}
+          <div style={{
+            display: "flex", background: "rgba(0,0,0,0.4)", padding: 3, borderRadius: 6, border: "1px solid rgba(255,255,255,0.1)"
+          }}>
+            <button
+              onClick={() => setViewMode("bionic")}
+              style={{
+                padding: "4px 10px", borderRadius: 4, border: "none", cursor: "pointer",
+                background: viewMode === "bionic" ? "#38bdf8" : "transparent",
+                color: viewMode === "bionic" ? "#0f172a" : "rgba(255,255,255,0.6)",
+                fontSize: 10, fontFamily: "monospace", fontWeight: 600
+              }}
+            >
+              ?? BIONIC CAD
+            </button>
+            <button
+              onClick={() => setViewMode("anatomy")}
+              style={{
+                padding: "4px 10px", borderRadius: 4, border: "none", cursor: "pointer",
+                background: viewMode === "anatomy" ? "#38bdf8" : "transparent",
+                color: viewMode === "anatomy" ? "#0f172a" : "rgba(255,255,255,0.6)",
+                fontSize: 10, fontFamily: "monospace", fontWeight: 600
+              }}
+            >
+              ?? ANATOMY
+            </button>
+          </div>
+
           <button
+            onClick={toggleAudioBio}
             className="btn"
-            onClick={() => setRunning(r => !r)}
             style={{
-              padding: "9px 20px",
-              background: running
-                ? "rgba(255,80,80,0.15)"
-                : "rgba(77,232,176,0.15)",
-              color: running ? "#ff5050" : "#4de8b0",
-              border: `1px solid ${running ? "rgba(255,80,80,0.3)" : "rgba(77,232,176,0.3)"}`,
-            }}>
-            {running ? "⏹ STOP" : "▶ RUN"}
+              padding: "7px 12px",
+              background: audioBioActive ? "rgba(74, 222, 128, 0.2)" : "rgba(255,255,255,0.05)",
+              color: audioBioActive ? "#4ade80" : "rgba(255,255,255,0.7)",
+              border: `1px solid ${audioBioActive ? "#4ade80" : "rgba(255,255,255,0.1)"}`,
+            }}
+          >
+            ?? {audioBioActive ? "MIC ACTIVE" : "AUDIO EMG"}
+          </button>
+
+          <button
+            onClick={() => setCalibOpen(true)}
+            className="btn"
+            style={{
+              padding: "7px 12px",
+              background: "rgba(168, 85, 247, 0.15)",
+              color: "#c084fc",
+              border: "1px solid rgba(168, 85, 247, 0.3)",
+            }}
+          >
+            ? CALIBRATE
+          </button>
+
+          <button
+            onClick={triggerStumble}
+            className="btn"
+            style={{
+              padding: "7px 14px",
+              background: "rgba(239, 68, 68, 0.2)",
+              color: "#f87171",
+              border: "1px solid rgba(239, 68, 68, 0.4)",
+              boxShadow: stumbleActive ? "0 0 15px rgba(239, 68, 68, 0.6)" : "none",
+            }}
+          >
+            ?? INJECT STUMBLE ({stumblesCaught})
+          </button>
+
+          <button
+            onClick={() => setRunning((r) => !r)}
+            className="btn"
+            style={{
+              padding: "7px 18px",
+              background: running ? "rgba(239, 68, 68, 0.15)" : "rgba(56, 189, 248, 0.15)",
+              color: running ? "#f87171" : "#38bdf8",
+              border: `1px solid ${running ? "rgba(239, 68, 68, 0.3)" : "rgba(56, 189, 248, 0.3)"}`,
+            }}
+          >
+            {running ? "? PAUSE" : "? START"}
           </button>
         </div>
       </header>
 
-      {/* Body */}
+      {/* MAIN THREE-COLUMN WORKSPACE */}
       <div style={{
         display: "grid",
-        gridTemplateColumns: "1fr 280px 320px",
-        gap: 0,
+        gridTemplateColumns: "380px 1fr 420px",
         flex: 1,
         minHeight: 0,
+        gap: 0,
       }}>
-
-        {/* ── LEFT: Knee Visualizer ── */}
+        {/* LEFT COLUMN: Visualizer & Live Kinematics */}
         <div style={{
-          borderRight: "1px solid rgba(255,255,255,0.06)",
-          padding: "24px",
-          display: "flex", flexDirection: "column", alignItems: "center",
-          gap: 20
+          borderRight: "1px solid rgba(255,255,255,0.08)",
+          padding: "20px",
+          display: "flex",
+          flexDirection: "column",
+          gap: 16,
+          background: "rgba(10, 14, 23, 0.5)",
+          overflowY: "auto",
         }}>
-          <div style={{
-            fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase",
-            color: "rgba(255,255,255,0.25)", fontFamily: "monospace"
-          }}>JOINT VISUALIZATION</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontSize: 9, letterSpacing: "0.15em", color: "rgba(255,255,255,0.4)", textTransform: "uppercase", fontFamily: "monospace" }}>
+              {viewMode === "bionic" ? "BIONIC CAD PROSTHETIC JOINT" : "BIOLOGICAL MUSCULOSKELETAL JOINT"}
+            </div>
+            <div style={{ fontSize: 9, color: currentPhase.color, fontFamily: "monospace", fontWeight: 600 }}>
+              {currentPhase.name}
+            </div>
+          </div>
 
-          {/* Anatomy */}
           <div style={{
-            background: "radial-gradient(ellipse at center, rgba(30,40,60,0.8) 0%, rgba(10,12,16,0.95) 70%)",
-            borderRadius: 16, padding: "20px 10px",
-            border: "1px solid rgba(255,255,255,0.05)",
-            width: "100%", maxWidth: 300,
-            display: "flex", flexDirection: "column", alignItems: "center", gap: 10,
-            position: "relative", overflow: "hidden"
+            background: "radial-gradient(ellipse at center, rgba(15, 23, 42, 0.8) 0%, rgba(7, 9, 14, 0.95) 80%)",
+            borderRadius: 14,
+            border: "1px solid rgba(255,255,255,0.08)",
+            padding: "10px",
+            position: "relative",
+            boxShadow: "inset 0 0 30px rgba(0,0,0,0.6)",
           }}>
-            {/* EMG heatmap glow */}
-            <div style={{
-              position: "absolute", inset: 0, borderRadius: 16,
-              background: `radial-gradient(ellipse at 50% 50%, rgba(${display.aiOutput > 0.5 ? "220,80,60" : "60,120,220"},${display.processedValue * 0.15}) 0%, transparent 70%)`,
-              transition: "background 0.3s", pointerEvents: "none"
-            }} />
+            {viewMode === "bionic" ? (
+              <BionicKneeSVG
+                angle={display.kneeAngle}
+                stiffness={display.stiffness}
+                damping={display.damping}
+                torque={display.torque}
+                stumbleActive={legRef.current.stumbleActive}
+                gaitPhase={currentPhase}
+                groundReactionForce={display.grf}
+              />
+            ) : (
+              <AnatomyKneeSVG
+                angle={display.kneeAngle}
+                quadActivation={display.bioState.quadActivation}
+                hamActivation={display.bioState.hamActivation}
+                quadForce={display.bioState.quadForce}
+                hamForce={display.bioState.hamForce}
+                coContraction={display.bioState.coContraction}
+              />
+            )}
+          </div>
 
-            <KneeAnatomySVG
-              angle={display.currentAngle}
-              emgActivity={display.processedValue}
-            />
-
-            {/* Legend */}
-            <div style={{ display: "flex", gap: 14, fontSize: 9, fontFamily: "monospace" }}>
-              {[
-                ["#f5e6c8", "Bone"],
-                ["#b8e0f0", "Cartilage / Meniscus"],
-                ["rgba(220,80,60,0.7)", "Quadriceps"],
-                ["rgba(60,120,220,0.7)", "Hamstring"],
-              ].map(([c, l]) => (
-                <div key={l} style={{ display: "flex", alignItems: "center", gap: 4, color: "rgba(255,255,255,0.4)" }}>
-                  <div style={{ width: 8, height: 8, borderRadius: 2, background: c }} />
-                  {l}
-                </div>
-              ))}
+          {/* 5-Phase Gait Cycle Timeline Bar */}
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "rgba(255,255,255,0.4)", fontFamily: "monospace", marginBottom: 6 }}>
+              <span>GAIT CYCLE PHASE</span>
+              <span style={{ color: currentPhase.color, fontWeight: 600 }}>{(display.gaitProgress * 100).toFixed(0)}%</span>
+            </div>
+            <div style={{ display: "flex", height: 8, borderRadius: 4, overflow: "hidden", background: "rgba(255,255,255,0.05)" }}>
+              {GAIT_PHASES.map((p) => {
+                const widthPct = (p.range[1] - p.range[0]) * 100;
+                const isCur = currentPhase.id === p.id;
+                return (
+                  <div
+                    key={p.id}
+                    title={p.name + ": " + p.desc}
+                    style={{
+                      width: `${widthPct}%`,
+                      background: isCur ? p.color : "rgba(255,255,255,0.1)",
+                      opacity: isCur ? 1 : 0.4,
+                      boxShadow: isCur ? `0 0 8px ${p.color}` : "none",
+                      transition: "all 0.15s",
+                    }}
+                  />
+                );
+              })}
+            </div>
+            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", fontFamily: "monospace", marginTop: 4 }}>
+              {currentPhase.desc}
             </div>
           </div>
 
-          {/* Metrics Row */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, width: "100%" }}>
-            <MetricCard label="Knee Angle" value={display.currentAngle.toFixed(1)} unit="°" color="#4de8b0" sublabel="Flexion" />
-            <MetricCard label="AI Output" value={(display.aiOutput * 100).toFixed(1)} unit="%" color="#3b82f6" sublabel="Neural Prediction" />
-            <MetricCard label="EMG Raw" value={display.rawValue.toFixed(3)} unit="mV" color="#f59e0b" sublabel="Rectified" />
-            <MetricCard label="EMG Filtered" value={display.processedValue.toFixed(3)} unit="mV" color="#a78bfa" sublabel="Low-pass" />
-          </div>
-
-          {/* Angle bar */}
-          <div style={{ width: "100%" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "rgba(255,255,255,0.3)", fontFamily: "monospace", marginBottom: 5 }}>
-              <span>0°</span><span>FLEXION RANGE</span><span>{maxAngle}°</span>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8, padding: "8px 10px" }}>
+              <div style={{ fontSize: 8, color: "rgba(255,255,255,0.4)", fontFamily: "monospace" }}>FLEXION ANGLE</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: "#38bdf8", fontFamily: "monospace" }}>
+                {display.kneeAngle.toFixed(1)}?
+              </div>
             </div>
-            <div style={{ height: 6, background: "rgba(255,255,255,0.06)", borderRadius: 3, overflow: "hidden" }}>
-              <div style={{
-                height: "100%", borderRadius: 3,
-                width: `${(display.currentAngle / maxAngle) * 100}%`,
-                background: "linear-gradient(90deg, #4de8b0, #3b82f6)",
-                transition: "width 0.05s", boxShadow: "0 0 8px rgba(77,232,176,0.4)"
-              }} />
+            <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8, padding: "8px 10px" }}>
+              <div style={{ fontSize: 8, color: "rgba(255,255,255,0.4)", fontFamily: "monospace" }}>NET TORQUE</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: "#f59e0b", fontFamily: "monospace" }}>
+                {display.torque.toFixed(1)} <span style={{ fontSize: 10 }}>N?m</span>
+              </div>
+            </div>
+            <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8, padding: "8px 10px" }}>
+              <div style={{ fontSize: 8, color: "rgba(255,255,255,0.4)", fontFamily: "monospace" }}>JOINT STIFFNESS (K)</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: "#4ade80", fontFamily: "monospace" }}>
+                {display.stiffness.toFixed(0)} <span style={{ fontSize: 9 }}>Nm/rad</span>
+              </div>
+            </div>
+            <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8, padding: "8px 10px" }}>
+              <div style={{ fontSize: 8, color: "rgba(255,255,255,0.4)", fontFamily: "monospace" }}>DAMPING (B)</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: display.damping > 30 ? "#ef4444" : "#a855f7", fontFamily: "monospace" }}>
+                {display.damping.toFixed(1)} <span style={{ fontSize: 9 }}>Nms/rad</span>
+              </div>
             </div>
           </div>
         </div>
 
-        {/* ── CENTER: Parameters ── */}
+        {/* CENTER COLUMN: Biomechanical & Neural Control Center */}
         <div style={{
-          borderRight: "1px solid rgba(255,255,255,0.06)",
-          padding: "24px 20px",
-          display: "flex", flexDirection: "column", gap: 20,
-          overflowY: "auto"
+          borderRight: "1px solid rgba(255,255,255,0.08)",
+          padding: "20px 24px",
+          display: "flex",
+          flexDirection: "column",
+          gap: 18,
+          overflowY: "auto",
         }}>
-          <div style={{ fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: "rgba(255,255,255,0.25)", fontFamily: "monospace" }}>
-            PARAMETERS
+          <div>
+            <div style={{ fontSize: 9, letterSpacing: "0.15em", color: "rgba(255,255,255,0.4)", textTransform: "uppercase", fontFamily: "monospace", marginBottom: 8 }}>
+              COMPARATIVE AI & BIOMECHANICAL CONTROL ARCHITECTURE
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {CONTROLLER_MODES.map((mode) => {
+                const isActive = controllerMode === mode.id;
+                return (
+                  <div
+                    key={mode.id}
+                    onClick={() => setControllerMode(mode.id)}
+                    style={{
+                      background: isActive ? "rgba(56, 189, 248, 0.12)" : "rgba(255,255,255,0.02)",
+                      border: `1px solid ${isActive ? "#38bdf8" : "rgba(255,255,255,0.08)"}`,
+                      borderRadius: 8,
+                      padding: "10px 12px",
+                      cursor: "pointer",
+                      transition: "all 0.15s",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: isActive ? "#38bdf8" : "#f1f5f9" }}>
+                        {mode.name}
+                      </span>
+                      <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 3, background: `${mode.badgeColor}22`, color: mode.badgeColor, border: `1px solid ${mode.badgeColor}55`, fontFamily: "monospace" }}>
+                        {mode.badge}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 9, color: "rgba(255,255,255,0.45)", lineHeight: 1.4 }}>
+                      {mode.description}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
 
-          {/* Activity Presets */}
           <div>
-            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 8, fontFamily: "monospace", letterSpacing: "0.1em" }}>
-              ACTIVITY PRESET
+            <div style={{ fontSize: 9, letterSpacing: "0.15em", color: "rgba(255,255,255,0.4)", textTransform: "uppercase", fontFamily: "monospace", marginBottom: 8 }}>
+              PHYSIOLOGICAL GAIT PRESETS
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-              {presets.map(p => (
-                <button key={p} className={`preset-btn${activityPreset === p ? " active" : ""}`}
-                  onClick={() => setActivityPreset(p)}>
-                  {p}
+              {["walking", "stairs", "sprint", "ramp", "rehab", "manual"].map((preset) => (
+                <button
+                  key={preset}
+                  className={`preset-btn${activityPreset === preset ? " active" : ""}`}
+                  onClick={() => setActivityPreset(preset)}
+                >
+                  {preset}
                 </button>
               ))}
             </div>
           </div>
 
-          {/* Manual EMG slider */}
-          {activityPreset === "manual" && (
-            <div>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-                <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", fontFamily: "monospace", letterSpacing: "0.1em" }}>EMG ACTIVITY</span>
-                <span style={{ fontSize: 11, color: "#f59e0b", fontFamily: "monospace" }}>{(manualActivity * 100).toFixed(0)}%</span>
-              </div>
-              <input type="range" min="0" max="1" step="0.01"
-                value={manualActivity}
-                onChange={e => setManualActivity(+e.target.value)} />
-            </div>
-          )}
-
-          {/* Smoothing Factor */}
-          <div>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", fontFamily: "monospace", letterSpacing: "0.1em" }}>SMOOTHING FACTOR</span>
-              <span style={{ fontSize: 11, color: "#a78bfa", fontFamily: "monospace" }}>{smoothing.toFixed(2)}</span>
-            </div>
-            <input type="range" min="0.01" max="1" step="0.01"
-              value={smoothing} onChange={e => setSmoothing(+e.target.value)} />
-            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.2)", marginTop: 4, fontFamily: "monospace" }}>
-              EMGProcessor.smoothingFactor → Low-pass filter α
-            </div>
-          </div>
-
-          {/* Max Angle */}
-          <div>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", fontFamily: "monospace", letterSpacing: "0.1em" }}>MAX ANGLE</span>
-              <span style={{ fontSize: 11, color: "#4de8b0", fontFamily: "monospace" }}>{maxAngle}°</span>
-            </div>
-            <input type="range" min="10" max="120" step="1"
-              value={maxAngle} onChange={e => setMaxAngle(+e.target.value)} />
-            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.2)", marginTop: 4, fontFamily: "monospace" }}>
-              AIKneeController.maxAngle
-            </div>
-          </div>
-
-          {/* Smooth Speed */}
-          <div>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", fontFamily: "monospace", letterSpacing: "0.1em" }}>LERP SPEED</span>
-              <span style={{ fontSize: 11, color: "#3b82f6", fontFamily: "monospace" }}>{smoothSpeed.toFixed(1)}</span>
-            </div>
-            <input type="range" min="0.5" max="20" step="0.5"
-              value={smoothSpeed} onChange={e => setSmoothSpeed(+e.target.value)} />
-            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.2)", marginTop: 4, fontFamily: "monospace" }}>
-              AIKneeController.smoothSpeed → Quaternion.Lerp
-            </div>
-          </div>
-
-          {/* Pipeline Diagram */}
           <div style={{
-            background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
-            borderRadius: 10, padding: "14px"
+            background: "rgba(255,255,255,0.02)",
+            border: "1px solid rgba(255,255,255,0.07)",
+            borderRadius: 10,
+            padding: "14px 16px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
           }}>
-            <div style={{ fontSize: 9, letterSpacing: "0.12em", color: "rgba(255,255,255,0.3)", marginBottom: 12, fontFamily: "monospace" }}>
-              SIGNAL PIPELINE
+            <div style={{ fontSize: 9, letterSpacing: "0.15em", color: "rgba(255,255,255,0.4)", textTransform: "uppercase", fontFamily: "monospace" }}>
+              AGONIST-ANTAGONIST MUSCLE RECRUITMENT
             </div>
-            {[
-              { label: "Raw EMG", value: display.rawValue.toFixed(3), color: "#f59e0b", file: "EMGProcessor" },
-              { label: "Rectify |x|", value: `→`, color: "#6b7280", file: "" },
-              { label: "Low-pass α", value: display.processedValue.toFixed(3), color: "#a78bfa", file: "EMGProcessor" },
-              { label: "Clamp [0,1]", value: display.aiOutput.toFixed(3), color: "#3b82f6", file: "EMGNeuralNetwork" },
-              { label: "× maxAngle", value: `${display.currentAngle.toFixed(1)}°`, color: "#4de8b0", file: "AIKneeController" },
-            ].map(({ label, value, color, file }) => (
-              <div key={label} style={{
-                display: "flex", justifyContent: "space-between", alignItems: "center",
-                padding: "5px 0", borderBottom: "1px solid rgba(255,255,255,0.04)"
-              }}>
-                <div>
-                  <div style={{ fontSize: 10, color: "rgba(255,255,255,0.6)", fontFamily: "monospace" }}>{label}</div>
-                  {file && <div style={{ fontSize: 8, color: "rgba(255,255,255,0.2)", fontFamily: "monospace" }}>{file}.cs</div>}
-                </div>
-                <div style={{ fontSize: 12, color, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>{value}</div>
+
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontFamily: "monospace", marginBottom: 5 }}>
+                <span style={{ color: "#f59e0b" }}>CH1: QUADRICEPS (EXTENSOR)</span>
+                <span style={{ color: "#f59e0b", fontWeight: 600 }}>
+                  {activityPreset === "manual" ? `${(quadManual * 100).toFixed(0)}%` : `${(display.bioState.quadActivation * 100).toFixed(0)}% LIVE`}
+                </span>
               </div>
-            ))}
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={activityPreset === "manual" ? quadManual : display.bioState.quadActivation}
+                onChange={(e) => {
+                  setActivityPreset("manual");
+                  setQuadManual(+e.target.value);
+                }}
+              />
+            </div>
+
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontFamily: "monospace", marginBottom: 5 }}>
+                <span style={{ color: "#38bdf8" }}>CH2: HAMSTRINGS (FLEXOR)</span>
+                <span style={{ color: "#38bdf8", fontWeight: 600 }}>
+                  {activityPreset === "manual" ? `${(hamManual * 100).toFixed(0)}%` : `${(display.bioState.hamActivation * 100).toFixed(0)}% LIVE`}
+                </span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={activityPreset === "manual" ? hamManual : display.bioState.hamActivation}
+                onChange={(e) => {
+                  setActivityPreset("manual");
+                  setHamManual(+e.target.value);
+                }}
+              />
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontFamily: "monospace", marginBottom: 5 }}>
+                <span style={{ color: "rgba(255,255,255,0.6)" }}>MAX FLEXION</span>
+                <span style={{ color: "#38bdf8" }}>{maxAngle}?</span>
+              </div>
+              <input type="range" min="30" max="110" step="1" value={maxAngle} onChange={(e) => setMaxAngle(+e.target.value)} />
+            </div>
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontFamily: "monospace", marginBottom: 5 }}>
+                <span style={{ color: "rgba(255,255,255,0.6)" }}>CONTROL LERP SPEED</span>
+                <span style={{ color: "#38bdf8" }}>{smoothSpeed.toFixed(1)}</span>
+              </div>
+              <input type="range" min="1" max="15" step="0.5" value={smoothSpeed} onChange={(e) => setSmoothSpeed(+e.target.value)} />
+            </div>
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontFamily: "monospace", marginBottom: 5 }}>
+                <span style={{ color: "rgba(255,255,255,0.6)" }}>BASE STIFFNESS (K)</span>
+                <span style={{ color: "#4ade80" }}>{baseStiffness} Nm/rad</span>
+              </div>
+              <input type="range" min="40" max="280" step="5" value={baseStiffness} onChange={(e) => setBaseStiffness(+e.target.value)} />
+            </div>
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontFamily: "monospace", marginBottom: 5 }}>
+                <span style={{ color: "rgba(255,255,255,0.6)" }}>BASE DAMPING (B)</span>
+                <span style={{ color: "#a855f7" }}>{baseDamping} Nms/rad</span>
+              </div>
+              <input type="range" min="2" max="35" step="1" value={baseDamping} onChange={(e) => setBaseDamping(+e.target.value)} />
+            </div>
+          </div>
+
+          <div style={{
+            background: "rgba(0,0,0,0.3)",
+            border: "1px solid rgba(255,255,255,0.06)",
+            borderRadius: 8,
+            padding: "12px 14px",
+            fontSize: 9,
+            color: "rgba(255,255,255,0.5)",
+            fontFamily: "monospace",
+            lineHeight: 1.6,
+          }}>
+            <strong style={{ color: "#38bdf8" }}>LIVE CONTROL PIPELINE:</strong><br />
+            1. Dual MUAP Spike Trains (1000 Hz) ? 20-450 Hz Bandpass ? RMS Window<br />
+            2. Hill-Type MTU Dynamics: f_l(?) & f_v(v) ? Net Biological Torque<br />
+            3. Adaptive Cross-Talk Cancellation Matrix + Variable Impedance FSM<br />
+            4. Stability Margin Verification: ICR vs GRF Line of Action
           </div>
         </div>
 
-        {/* ── RIGHT: Charts + Log ── */}
+        {/* RIGHT COLUMN: Telemetry, Oscilloscope, Spectrum & Logger */}
         <div style={{
-          padding: "24px 20px",
-          display: "flex", flexDirection: "column", gap: 16,
-          overflowY: "auto"
+          padding: "20px",
+          display: "flex",
+          flexDirection: "column",
+          gap: 14,
+          background: "rgba(10, 14, 23, 0.5)",
+          overflowY: "auto",
         }}>
-          <div style={{ fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: "rgba(255,255,255,0.25)", fontFamily: "monospace" }}>
-            SIGNAL MONITOR
+          <div style={{ fontSize: 9, letterSpacing: "0.15em", color: "rgba(255,255,255,0.4)", textTransform: "uppercase", fontFamily: "monospace" }}>
+            HIGH-SPEED TELEMETRY & RESEARCH SUITE
           </div>
 
-          <EMGChart
-            rawHistory={display.rawHistory}
-            processedHistory={display.processedHistory}
-            label="EMG Signal (Raw ╌ / Filtered ─)"
-            color="#a78bfa"
-            bgColor="rgba(167,139,250,0.05)"
+          <SignalOscilloscope
+            rawQuadHistory={display.rawQuadHistory}
+            filtQuadHistory={display.filtQuadHistory}
+            rawHamHistory={display.rawHamHistory}
+            filtHamHistory={display.filtHamHistory}
+            quadRecruitment={display.bioState.quadActivation}
+            hamRecruitment={display.bioState.hamActivation}
           />
 
-          <EMGChart
-            rawHistory={display.angleHistory}
-            processedHistory={display.angleHistory}
-            label="Knee Angle (normalized)"
-            color="#4de8b0"
-            bgColor="rgba(77,232,176,0.05)"
+          <SpectrumAndPhase
+            fftSpectrum={display.fftSpectrum}
+            medianFrequency={display.medianFreq}
+            fatigueLevel={display.fatigueLevel}
+            orbitHistory={display.orbitHistory}
+            kneeAngle={display.kneeAngle}
+            kneeVelocity={display.kneeVelocity}
           />
 
-          {/* Research Log */}
           <div style={{
-            background: "rgba(255,255,255,0.02)",
-            border: "1px solid rgba(255,255,255,0.06)",
-            borderRadius: 10, padding: "12px", flex: 1
+            background: "rgba(15, 23, 42, 0.6)",
+            border: "1px solid rgba(255, 255, 255, 0.08)",
+            borderRadius: 10,
+            padding: "12px",
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            minHeight: 180,
           }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-              <div style={{ fontSize: 9, letterSpacing: "0.12em", color: "rgba(255,255,255,0.3)", fontFamily: "monospace", textTransform: "uppercase" }}>
-                Research Log
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <div style={{ fontSize: 9, letterSpacing: "0.12em", color: "rgba(255,255,255,0.4)", textTransform: "uppercase", fontFamily: "monospace" }}>
+                CLINICAL RESEARCH LOG ({logEntries.length})
               </div>
               <div style={{ display: "flex", gap: 6 }}>
-                <button className="btn" onClick={logSnapshot} style={{
-                  padding: "5px 10px", background: "rgba(77,232,176,0.1)",
-                  color: "#4de8b0", border: "1px solid rgba(77,232,176,0.2)"
-                }}>⬤ SNAP</button>
-                <button className="btn" onClick={exportCSV} style={{
-                  padding: "5px 10px", background: "rgba(59,130,246,0.1)",
-                  color: "#3b82f6", border: "1px solid rgba(59,130,246,0.2)"
-                }}>↓ CSV</button>
-                <button className="btn" onClick={resetLog} style={{
-                  padding: "5px 10px", background: "rgba(255,80,80,0.08)",
-                  color: "#ff5050", border: "1px solid rgba(255,80,80,0.15)"
-                }}>✕</button>
+                <button
+                  onClick={takeSnapshot}
+                  className="btn"
+                  style={{ padding: "4px 8px", background: "rgba(56, 189, 248, 0.2)", color: "#38bdf8", border: "1px solid #38bdf8" }}
+                >
+                  ? SNAP
+                </button>
+                <button
+                  onClick={exportCSV}
+                  className="btn"
+                  style={{ padding: "4px 8px", background: "rgba(74, 222, 128, 0.2)", color: "#4ade80", border: "1px solid #4ade80" }}
+                >
+                  ? CSV
+                </button>
+                <button
+                  onClick={exportJSON}
+                  className="btn"
+                  style={{ padding: "4px 8px", background: "rgba(168, 85, 247, 0.2)", color: "#c084fc", border: "1px solid #c084fc" }}
+                >
+                  ? JSON
+                </button>
+                <button
+                  onClick={() => setLogEntries([])}
+                  className="btn"
+                  style={{ padding: "4px 8px", background: "rgba(239, 68, 68, 0.15)", color: "#f87171", border: "1px solid rgba(239, 68, 68, 0.3)" }}
+                >
+                  ?
+                </button>
               </div>
             </div>
 
-            <div style={{ overflowY: "auto", maxHeight: 200 }}>
+            <div style={{ overflowY: "auto", flex: 1, maxHeight: 160 }}>
               {logEntries.length === 0 ? (
-                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.2)", fontFamily: "monospace", textAlign: "center", padding: "20px 0" }}>
-                  Press SNAP to record a data point
+                <div style={{ textAlign: "center", padding: "24px 0", fontSize: 9, color: "rgba(255,255,255,0.3)", fontFamily: "monospace" }}>
+                  Click SNAP to capture synchronized kinematics, EMG & impedance data points
                 </div>
               ) : (
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 9, fontFamily: "'JetBrains Mono', monospace" }}>
                   <thead>
-                    <tr style={{ color: "rgba(255,255,255,0.3)" }}>
-                      {["Time", "Preset", "EMG", "AI Out", "Angle°"].map(h => (
-                        <th key={h} style={{ textAlign: "left", padding: "3px 5px", letterSpacing: "0.08em" }}>{h}</th>
-                      ))}
+                    <tr style={{ color: "rgba(255,255,255,0.3)", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+                      <th style={{ textAlign: "left", padding: "3px 4px" }}>Time</th>
+                      <th style={{ textAlign: "left", padding: "3px 4px" }}>Phase</th>
+                      <th style={{ textAlign: "left", padding: "3px 4px" }}>Angle?</th>
+                      <th style={{ textAlign: "left", padding: "3px 4px" }}>Q/H mV</th>
+                      <th style={{ textAlign: "left", padding: "3px 4px" }}>K (Nm)</th>
+                      <th style={{ textAlign: "left", padding: "3px 4px" }}>MDF</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {logEntries.map((e, i) => (
-                      <tr key={i} style={{ borderTop: "1px solid rgba(255,255,255,0.04)" }}>
-                        <td style={{ padding: "3px 5px", color: "rgba(255,255,255,0.35)" }}>{e.t}</td>
-                        <td style={{ padding: "3px 5px", color: "#4de8b0" }}>{e.preset}</td>
-                        <td style={{ padding: "3px 5px", color: "#a78bfa" }}>{e.emg}</td>
-                        <td style={{ padding: "3px 5px", color: "#3b82f6" }}>{e.ai}</td>
-                        <td style={{ padding: "3px 5px", color: "#f59e0b" }}>{e.angle}</td>
+                    {logEntries.map((e, idx) => (
+                      <tr key={idx} style={{ borderBottom: "1px solid rgba(255,255,255,0.03)" }}>
+                        <td style={{ padding: "3px 4px", color: "rgba(255,255,255,0.4)" }}>{e.t}</td>
+                        <td style={{ padding: "3px 4px", color: "#38bdf8" }}>{e.phase.split(" ")[0]}</td>
+                        <td style={{ padding: "3px 4px", color: "#4ade80" }}>{e.angle}?</td>
+                        <td style={{ padding: "3px 4px", color: "#f59e0b" }}>{e.quadEMG}/{e.hamEMG}</td>
+                        <td style={{ padding: "3px 4px", color: "#c084fc" }}>{e.stiffness}</td>
+                        <td style={{ padding: "3px 4px", color: e.mdf < 80 ? "#ef4444" : "rgba(255,255,255,0.6)" }}>{e.mdf} Hz</td>
                       </tr>
                     ))}
                   </tbody>
@@ -729,20 +852,18 @@ export default function App() {
               )}
             </div>
           </div>
-
-          {/* Info Block */}
-          <div style={{
-            background: "rgba(59,130,246,0.05)", border: "1px solid rgba(59,130,246,0.15)",
-            borderRadius: 8, padding: "10px 12px", fontSize: 9,
-            color: "rgba(255,255,255,0.35)", fontFamily: "monospace", lineHeight: 1.7
-          }}>
-            <strong style={{ color: "#3b82f6", letterSpacing: "0.08em" }}>PIPELINE</strong><br />
-            EMGProcessor → Rectify → LPF(α) →<br />
-            EMGNeuralNetwork → Clamp[0,1] →<br />
-            AIKneeController → Lerp(targetAngle, speed)
-          </div>
         </div>
       </div>
+
+      <CalibrationModal
+        isOpen={calibOpen}
+        onClose={() => setCalibOpen(false)}
+        onApplyCalibration={(data) => {
+          console.log("Calibration applied:", data);
+        }}
+        currentRawQuad={display.rawQuadHistory[display.rawQuadHistory.length - 1]}
+        currentRawHam={display.rawHamHistory[display.rawHamHistory.length - 1]}
+      />
     </div>
   );
 }
